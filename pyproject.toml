@@ -1,0 +1,24 @@
+[project]
+name = "call_me_maybe"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "llm-sdk",
+    "numpy",
+    "pydantic",
+    "pytest>=9.1.1",
+    "mypy>=2.3.0",
+    "flake8>=7.3.0",
+    "fire>=0.7.1",
+]
+
+[tool.uv.workspace]
+members = [
+    "llm_sdk",
+]
+
+[tool.uv.sources]
+llm-sdk = { workspace = true }
+
+[tool.mypy]
+mypy_path = "llm_sdk"

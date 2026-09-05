@@ -1,0 +1,288 @@
+import json
+from llm_sdk import Small_LLM_Model
+from .llm import build_prompt
+from .models import FunctionCall, FunctionDefinition
+from pydantic import BaseModel, ConfigDict, PrivateAttr
+from typing import Any
+
+
+class ConstrainedDecoder(BaseModel):
+    """Generate function calls using constrained LLM decoding."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model: Small_LLM_Model
+    _safe_string_tokens: dict[int, str] = PrivateAttr(
+        default_factory=dict
+    )
+
+    def _encode(self, text: str) -> list[int]:
+        """Encode text and return a simple list of token IDs."""
+        raw: object = self.model.encode(text).tolist()
+        if (
+            not isinstance(raw, list)
+            or not raw
+            or not isinstance(raw[0], list)
+        ):
+            raise ValueError("Could not encode text.")
+        result: list[int] = []
+        for token_id in raw[0]:
+            if not isinstance(token_id, int):
+                raise ValueError("Tokenizer returned an invalid token ID.")
+            result.append(token_id)
+        return result
+
+    def filter_logits(
+        self,
+        input_ids: list[int],
+        allowed_tokens: set[int],
+    ) -> int:
+        """Choose the highest-scoring allowed token."""
+
+        if not allowed_tokens:
+            raise ValueError("No allowed tokens available.")
+        logits = self.model.get_logits_from_input_ids(input_ids)
+        return max(
+            allowed_tokens,
+            key=lambda token_id: logits[token_id],
+        )
+
+    def force_text(self, text: str, input_ids: list[int]) -> None:
+        """Append fixed text to the current generation."""
+        input_ids.extend(self._encode(text))
+
+    def generate_choice(
+        self,
+        input_ids: list[int],
+        choices: list[str],
+        suffix: str = "",
+    ) -> str:
+        """Let the LLM choose one value from a fixed set."""
+
+        candidates = {
+            choice: self._encode(choice + suffix)
+            for choice in choices
+        }
+        generated: list[int] = []
+        while candidates:
+            allowed_tokens: set[int] = set()
+            for tokens in candidates.values():
+                if len(generated) < len(tokens):
+                    allowed_tokens.add(tokens[len(generated)])
+            next_token = self.filter_logits(
+                input_ids,
+                allowed_tokens,
+            )
+
+            input_ids.append(next_token)
+            generated.append(next_token)
+
+            candidates = {
+                choice: tokens
+                for choice, tokens in candidates.items()
+                if tokens[:len(generated)] == generated
+            }
+            for choice, tokens in candidates.items():
+                if generated == tokens:
+                    return choice
+        raise ValueError("The LLM could not choose a valid value.")
+
+    def _single_token(self, text: str) -> int:
+        """Return the token ID for one allowed character."""
+        token_ids = self._encode(text)
+        if len(token_ids) != 1:
+            raise ValueError(
+                f"'{text}' does not map to exactly one token."
+            )
+        return token_ids[0]
+
+    def generate_number(
+            self, input_ids: list[int], stop_character: str) -> str:
+        """Generate a constrained JSON number."""
+        character_ids = {
+            character: self._single_token(character)
+            for character in "0123456789-."
+        }
+
+        stop_id = self._single_token(stop_character)
+        result = ""
+        for _ in range(32):
+            allowed: set[int] = set()
+
+            if not result:
+                allowed.add(character_ids["-"])
+                for digit in "0123456789":
+                    allowed.add(character_ids[digit])
+
+            elif result == "-":
+                for digit in "0123456789":
+                    allowed.add(character_ids[digit])
+
+            elif result.endswith("."):
+                for digit in "0123456789":
+                    allowed.add(character_ids[digit])
+
+            else:
+                for digit in "0123456789":
+                    allowed.add(character_ids[digit])
+                if "." not in result:
+                    allowed.add(character_ids["."])
+                allowed.add(stop_id)
+
+            next_token = self.filter_logits(input_ids, allowed)
+
+            if next_token == stop_id:
+                return result
+            input_ids.append(next_token)
+            for character, token_id in character_ids.items():
+                if token_id == next_token:
+                    result += character
+                    break
+        raise ValueError("Generated number is too long.")
+
+    def _get_safe_string_tokens(self) -> dict[int, str]:
+        """Return vocabulary tokens safe inside a JSON string."""
+
+        if self._safe_string_tokens:
+            return self._safe_string_tokens
+
+        vocab_path = self.model.get_path_to_vocab_file()
+        with open(vocab_path, "r", encoding="utf-8") as file:
+            raw: object = json.load(file)
+
+        if not isinstance(raw, dict):
+            raise ValueError("Invalid vocabulary file.")
+
+        safe_tokens: dict[int, str] = {}
+        for value in raw.values():
+            if not isinstance(value, int):
+                continue
+            text = self.model.decode([value])
+            if (
+                text
+                and '"' not in text
+                and "\\" not in text
+                and "\ufffd" not in text
+                and all(ord(character) >= 32 for character in text)
+            ):
+                safe_tokens[value] = text
+
+        if not safe_tokens:
+            raise ValueError("No safe string tokens found.")
+
+        self._safe_string_tokens = safe_tokens
+        return safe_tokens
+
+    def generate_string(self, input_ids: list[int]) -> Any:
+        """Generate a constrained JSON string."""
+
+        content_tokens = self._get_safe_string_tokens()
+        quote_id = self._single_token('"')
+        backslash_id = self._single_token("\\")
+
+        escape_tokens = {
+            self._single_token(char): char
+            for char in '"\\/bfnrt'
+        }
+        allowed = set(content_tokens)
+        allowed.add(quote_id)
+        allowed.add(backslash_id)
+        encoded = ""
+        for _ in range(128):
+            next_token = self.filter_logits(
+                input_ids,
+                allowed,
+            )
+            if next_token == quote_id:
+                return json.loads(f'"{encoded}"')
+            input_ids.append(next_token)
+
+            if next_token != backslash_id:
+                encoded += content_tokens[next_token]
+                continue
+            encoded += "\\"
+            escape_token = self.filter_logits(
+                input_ids,
+                set(escape_tokens),
+            )
+            input_ids.append(escape_token)
+            print
+            encoded += escape_tokens[escape_token]
+        return json.loads(f'"{encoded}"')
+
+    def generate_parameters(
+        self,
+        function_name: str,
+        functions: list[FunctionDefinition],
+        input_ids: list[int],
+    ) -> dict[str, object]:
+        """Generate parameters required by the selected function."""
+
+        selected = next(
+            (f for f in functions if f.name == function_name),
+            None,
+        )
+        if selected is None:
+            raise ValueError("Selected function does not exist.")
+
+        parameters: dict[str, object] = {}
+        items = list(selected.parameters.items())
+        if not items:
+            self.force_text("}", input_ids)
+            return parameters
+
+        for index, (name, definition) in enumerate(items):
+            self.force_text(f'"{name}":', input_ids)
+            last_parameter = index == len(items) - 1
+            stop_character = "}" if last_parameter else ","
+
+            if definition.type in ("number", "float", "integer"):
+                number = self.generate_number(input_ids, stop_character)
+                if definition.type == "integer":
+                    parameters[name] = int(float(number))
+                else:
+                    parameters[name] = float(number)
+
+            elif definition.type == "string":
+                self.force_text('"', input_ids)
+                value = self.generate_string(input_ids)
+                self.force_text('"', input_ids)
+                parameters[name] = value
+
+            elif definition.type == "boolean":
+                value = self.generate_choice(input_ids, ["true", "false"])
+                parameters[name] = value == "true"
+
+            else:
+                raise ValueError(
+                    f"Unsupported parameter type: "
+                    f"{definition.type}"
+                )
+            self.force_text(stop_character, input_ids,)
+        return parameters
+
+    def decode(self, prompt: str,
+               functions: list[FunctionDefinition]) -> FunctionCall:
+        """Generate one constrained function call."""
+
+        llm_prompt = build_prompt(prompt, functions)
+        input_ids = self._encode(llm_prompt)
+
+        self.force_text('{"name":"', input_ids)
+        function_name = self.generate_choice(
+            input_ids,
+            [function.name for function in functions],
+            suffix='"',
+        )
+        self.force_text(',"parameters":{', input_ids,)
+        parameters = self.generate_parameters(
+            function_name,
+            functions,
+            input_ids,
+        )
+        self.force_text("}", input_ids)
+
+        return FunctionCall(
+            prompt=prompt,
+            name=function_name,
+            parameters=parameters,
+        )

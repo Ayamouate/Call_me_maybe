@@ -1,0 +1,10 @@
+[
+  {
+    "prompt": "What is the product of -9 and -40.0 ?",
+    "name": "fn_multiply_numbers",
+    "parameters": {
+      "a": -9.0,
+      "b": -40.0
+    }
+  }
+]
