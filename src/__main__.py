@@ -26,6 +26,7 @@ def main() -> None:
     )
 
     results: list[FunctionCall] = []
+
     for index, prompt_item in enumerate(parser.prompts):
         print(
             f"Processing {index + 1}/{len(parser.prompts)}: "
@@ -34,28 +35,22 @@ def main() -> None:
         result = decoder.decode(prompt_item.prompt, parser.functions)
         results.append(result)
         print(
-            f"\nResult:\n\nFonction name: {
-                result.name}\nParameters: {
-                result.parameters}\n")
-
-    # for prompt_item in parser.prompts:
-    #     result = decoder.decode(
-    #         prompt_item.prompt,
-    #         parser.functions,
-    #     )
-    #     results.append(result)
+            "\nResult:\n\n"
+            f"Function name: {result.name}\n"
+            f"Parameters: {result.parameters}\n"
+        )
 
     write_results(results, arguments.output)
 
-    print(
-        f"Generated {len(results)} function calls "
-        f"in '{arguments.output}'."
-    )
+    # print(
+    #     f"Generated {len(results)} function calls "
+    #     f"in '{arguments.output}'."
+    # )
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         print(f"Error: {exc}")
         sys.exit(1)

@@ -1,9 +1,13 @@
 import json
+import re
 from llm_sdk import Small_LLM_Model
 from .llm import build_prompt
 from .models import FunctionCall, FunctionDefinition
 from pydantic import BaseModel, ConfigDict, PrivateAttr
-from typing import Any
+
+
+INT_MIN = -(2**63)
+INT_MAX = 2**63 - 1
 
 
 class ConstrainedDecoder(BaseModel):
@@ -95,9 +99,25 @@ class ConstrainedDecoder(BaseModel):
             )
         return token_ids[0]
 
+    def _validate_integer(self, number: str) -> int:
+        """Convert and validate a signed 64-bit integer."""
+
+        value = int(number)
+        if value < INT_MIN or value > INT_MAX:
+            raise ValueError(
+                f"Integer {value} is outside the allowed range "
+                f"[{INT_MIN}, {INT_MAX}]."
+            )
+        return value
+
     def generate_number(
-            self, input_ids: list[int], stop_character: str) -> str:
+            self,
+            input_ids: list[int],
+            stop_character: str,
+            integer_only: bool = False,
+    ) -> str:
         """Generate a constrained JSON number."""
+
         character_ids = {
             character: self._single_token(character)
             for character in "0123456789-."
@@ -117,6 +137,11 @@ class ConstrainedDecoder(BaseModel):
                 for digit in "0123456789":
                     allowed.add(character_ids[digit])
 
+            elif result in ("0", "-0"):
+                allowed.add(stop_id)
+                if not integer_only:
+                    allowed.add(character_ids["."])
+
             elif result.endswith("."):
                 for digit in "0123456789":
                     allowed.add(character_ids[digit])
@@ -124,7 +149,7 @@ class ConstrainedDecoder(BaseModel):
             else:
                 for digit in "0123456789":
                     allowed.add(character_ids[digit])
-                if "." not in result:
+                if not integer_only and "." not in result:
                     allowed.add(character_ids["."])
                 allowed.add(stop_id)
 
@@ -138,6 +163,94 @@ class ConstrainedDecoder(BaseModel):
                     result += character
                     break
         raise ValueError("Generated number is too long.")
+
+    def _is_valid_regex(self, pattern: str) -> bool:
+        """Check whether a regex pattern is valid."""
+
+        try:
+            re.compile(pattern)
+        except re.error:
+            return False
+
+        return True
+
+    def _should_stop_regex(
+        self,
+        current: str,
+        next_text: str,
+    ) -> bool:
+        """Decide whether a completed regex should stop."""
+
+        if not current:
+            return False
+
+        if not self._is_valid_regex(current):
+            return False
+
+        if current.endswith("]") and not next_text.startswith(
+            ("+", "*", "?", "{")
+        ):
+            return True
+
+        if current.endswith(")") and next_text[:1].isspace():
+            return True
+
+        if "|" in next_text:
+            return True
+
+        if current.isalnum() and next_text.startswith("."):
+            return True
+
+        return False
+
+    def generate_regex(self, input_ids: list[int]) -> str:
+        """Generate a short valid regex string."""
+
+        content_tokens = self._get_safe_string_tokens()
+        quote_id = self._single_token('"')
+        backslash_id = self._single_token("\\")
+        escape_tokens = {
+            self._single_token(char): char
+            for char in '"\\/'
+        }
+        allowed = set(content_tokens)
+        allowed.add(quote_id)
+        allowed.add(backslash_id)
+
+        encoded = ""
+        last_valid = ""
+        for _ in range(64):
+            next_token = self.filter_logits(input_ids, allowed)
+            if next_token == quote_id:
+                value = self._decode_json_string(encoded)
+                if self._is_valid_regex(value):
+                    return value
+                break
+            if next_token == backslash_id:
+                input_ids.append(next_token)
+                encoded += "\\"
+
+                escape_token = self.filter_logits(
+                    input_ids,
+                    set(escape_tokens),
+                )
+                input_ids.append(escape_token)
+                encoded += escape_tokens[escape_token]
+            else:
+                text = content_tokens[next_token]
+                current = self._decode_json_string(encoded)
+
+                if self._should_stop_regex(current, text):
+                    return current
+
+                input_ids.append(next_token)
+                encoded += text
+            value = self._decode_json_string(encoded)
+            if self._is_valid_regex(value):
+                last_valid = value
+        if last_valid:
+            return last_valid
+        raise ValueError("Could not generate a valid regex.")
 
     def _get_safe_string_tokens(self) -> dict[int, str]:
         """Return vocabulary tokens safe inside a JSON string."""
@@ -172,13 +285,24 @@ class ConstrainedDecoder(BaseModel):
         self._safe_string_tokens = safe_tokens
         return safe_tokens
 
-    def generate_string(self, input_ids: list[int]) -> Any:
+    def _decode_json_string(self, encoded: str) -> str:
+        """Decode JSON string content and ensure it is a string."""
+
+        value: object = json.loads(f'"{encoded}"')
+        if not isinstance(value, str):
+            raise ValueError("Decoded JSON value is not a string.")
+        return value
+
+    def generate_string(
+        self,
+        input_ids: list[int],
+        stop_symbol_tail: bool = False,
+    ) -> str:
         """Generate a constrained JSON string."""
 
         content_tokens = self._get_safe_string_tokens()
         quote_id = self._single_token('"')
         backslash_id = self._single_token("\\")
-
         escape_tokens = {
             self._single_token(char): char
             for char in '"\\/bfnrt'
@@ -187,27 +311,43 @@ class ConstrainedDecoder(BaseModel):
         allowed.add(quote_id)
         allowed.add(backslash_id)
         encoded = ""
+
         for _ in range(128):
-            next_token = self.filter_logits(
-                input_ids,
-                allowed,
-            )
+            next_token = self.filter_logits(input_ids, allowed)
             if next_token == quote_id:
-                return json.loads(f'"{encoded}"')
-            input_ids.append(next_token)
+                return self._decode_json_string(encoded)
 
             if next_token != backslash_id:
-                encoded += content_tokens[next_token]
+                text = content_tokens[next_token]
+                current = self._decode_json_string(encoded)
+
+                if (
+                    stop_symbol_tail
+                    and current
+                    and all(
+                        not char.isalnum() and not char.isspace()
+                        for char in current
+                    )
+                    and all(
+                        not char.isalnum() and not char.isspace()
+                        for char in text
+                    )
+                ):
+                    return current
+                input_ids.append(next_token)
+                encoded += text
                 continue
+
+            input_ids.append(next_token)
             encoded += "\\"
             escape_token = self.filter_logits(
                 input_ids,
                 set(escape_tokens),
             )
             input_ids.append(escape_token)
-            print
             encoded += escape_tokens[escape_token]
-        return json.loads(f'"{encoded}"')
+
+        return self._decode_json_string(encoded)
 
     def generate_parameters(
         self,
@@ -236,15 +376,27 @@ class ConstrainedDecoder(BaseModel):
             stop_character = "}" if last_parameter else ","
 
             if definition.type in ("number", "float", "integer"):
-                number = self.generate_number(input_ids, stop_character)
-                if definition.type == "integer":
-                    parameters[name] = int(float(number))
+                integer_only = definition.type == "integer"
+                number = self.generate_number(
+                    input_ids,
+                    stop_character,
+                    integer_only=integer_only,
+                )
+
+                if integer_only:
+                    parameters[name] = self._validate_integer(number)
                 else:
                     parameters[name] = float(number)
 
             elif definition.type == "string":
                 self.force_text('"', input_ids)
-                value = self.generate_string(input_ids)
+                if name == "regex":
+                    value = self.generate_regex(input_ids)
+                else:
+                    value = self.generate_string(
+                        input_ids,
+                        stop_symbol_tail=name == "replacement",
+                    )
                 self.force_text('"', input_ids)
                 parameters[name] = value
 
@@ -254,10 +406,9 @@ class ConstrainedDecoder(BaseModel):
 
             else:
                 raise ValueError(
-                    f"Unsupported parameter type: "
-                    f"{definition.type}"
+                    f"Unsupported parameter type: {definition.type}"
                 )
-            self.force_text(stop_character, input_ids,)
+            self.force_text(stop_character, input_ids)
         return parameters
 
     def decode(self, prompt: str,
@@ -270,9 +421,14 @@ class ConstrainedDecoder(BaseModel):
         self.force_text('{"name":"', input_ids)
         function_name = self.generate_choice(
             input_ids,
-            [function.name for function in functions],
+            [function.name for function in functions]
+            + ["__no_match__"],
             suffix='"',
         )
+        if function_name == "__no_match__":
+            raise ValueError(
+                f"No available function matches prompt: {prompt!r}"
+            )
         self.force_text(',"parameters":{', input_ids,)
         parameters = self.generate_parameters(
             function_name,

@@ -9,9 +9,14 @@ def build_prompt(user_prompt: str, functions: list[FunctionDefinition]) -> str:
     functions_data = [function.model_dump() for function in functions]
     return (
         "Choose the function that best matches the user request.\n"
+        "If no available function can satisfy the request, use "
+        "'__no_match__' as the function name.\n"
         "Extract the exact required parameter values.\n"
         "Do not explain parameter values or add extra text.\n"
         "Use valid JSON escaping for string values.\n"
+        "For regex parameters, generate one concise valid regex. "
+        "Prefer the simplest pattern that matches the requested "
+        "target and do not repeat equivalent alternatives.\n"
         "Return a JSON object with 'name' and 'parameters'.\n\n"
         f"Available functions:\n"
         f"{json.dumps(functions_data, indent=2)}\n\n"

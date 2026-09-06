@@ -1,15 +1,13 @@
 import json
-from typing import List
 from .models import PromptItem, FunctionDefinition
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 
-class Parser:
+class Parser(BaseModel):
     """Load and validate project input JSON files."""
 
-    def __init__(self) -> None:
-        self.functions: List[FunctionDefinition] = []
-        self.prompts: List[PromptItem] = []
+    functions: list[FunctionDefinition] = Field(default_factory=list)
+    prompts: list[PromptItem] = Field(default_factory=list)
 
     def _load_json(self, file: str) -> object:
         """Load Json data from a file"""
