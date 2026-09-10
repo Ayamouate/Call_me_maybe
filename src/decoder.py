@@ -6,10 +6,6 @@ from .models import FunctionCall, FunctionDefinition
 from pydantic import BaseModel, ConfigDict, PrivateAttr
 
 
-INT_MIN = -(2**63)
-INT_MAX = 2**63 - 1
-
-
 class ConstrainedDecoder(BaseModel):
     """Generate function calls using constrained LLM decoding."""
 
@@ -99,17 +95,6 @@ class ConstrainedDecoder(BaseModel):
             )
         return token_ids[0]
 
-    def _validate_integer(self, number: str) -> int:
-        """Convert and validate a signed 64-bit integer."""
-
-        value = int(number)
-        if value < INT_MIN or value > INT_MAX:
-            raise ValueError(
-                f"Integer {value} is outside the allowed range "
-                f"[{INT_MIN}, {INT_MAX}]."
-            )
-        return value
-
     def generate_number(
             self,
             input_ids: list[int],
@@ -125,7 +110,7 @@ class ConstrainedDecoder(BaseModel):
 
         stop_id = self._single_token(stop_character)
         result = ""
-        for _ in range(32):
+        for _ in range(64):
             allowed: set[int] = set()
 
             if not result:
@@ -162,7 +147,6 @@ class ConstrainedDecoder(BaseModel):
                 if token_id == next_token:
                     result += character
                     break
-        raise ValueError("Generated number is too long.")
 
     def _is_valid_regex(self, pattern: str) -> bool:
         """Check whether a regex pattern is valid."""
@@ -171,7 +155,6 @@ class ConstrainedDecoder(BaseModel):
             re.compile(pattern)
         except re.error:
             return False
-
         return True
 
     def _should_stop_regex(
@@ -219,7 +202,7 @@ class ConstrainedDecoder(BaseModel):
 
         encoded = ""
         last_valid = ""
-        for _ in range(64):
+        for _ in range(32):
             next_token = self.filter_logits(input_ids, allowed)
             if next_token == quote_id:
                 value = self._decode_json_string(encoded)
@@ -312,7 +295,7 @@ class ConstrainedDecoder(BaseModel):
         allowed.add(backslash_id)
         encoded = ""
 
-        for _ in range(128):
+        for _ in range(32):
             next_token = self.filter_logits(input_ids, allowed)
             if next_token == quote_id:
                 return self._decode_json_string(encoded)
@@ -384,7 +367,7 @@ class ConstrainedDecoder(BaseModel):
                 )
 
                 if integer_only:
-                    parameters[name] = self._validate_integer(number)
+                    parameters[name] = int(number)
                 else:
                     parameters[name] = float(number)
 

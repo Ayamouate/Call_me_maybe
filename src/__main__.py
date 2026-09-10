@@ -20,6 +20,11 @@ def main() -> None:
             "No function definitions were provided."
         )
 
+    if not parser.prompts:
+        raise ValueError(
+            "No prompts were provided."
+        )
+
     model = Small_LLM_Model()
     decoder = ConstrainedDecoder(
         model=model,
@@ -32,7 +37,15 @@ def main() -> None:
             f"Processing {index + 1}/{len(parser.prompts)}: "
             f"{prompt_item.prompt}"
         )
-        result = decoder.decode(prompt_item.prompt, parser.functions)
+        try:
+            result = decoder.decode(prompt_item.prompt, parser.functions)
+        except Exception as exc:
+            print(f"  -> failed, marking as unknown: {exc}")
+            result = FunctionCall(
+                prompt=prompt_item.prompt,
+                name="unknown",
+                parameters={},
+            )
         results.append(result)
         print(
             "\nResult:\n\n"
