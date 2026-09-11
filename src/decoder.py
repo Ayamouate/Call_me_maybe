@@ -96,57 +96,47 @@ class ConstrainedDecoder(BaseModel):
         return token_ids[0]
 
     def generate_number(
-            self,
-            input_ids: list[int],
-            stop_character: str,
-            integer_only: bool = False,
+        self,
+        input_ids: list[int],
+        stop_character: str,
+        integer_only: bool = False,
     ) -> str:
         """Generate a constrained JSON number."""
 
-        character_ids = {
-            character: self._single_token(character)
-            for character in "0123456789-."
+        ids = {
+            char: self._single_token(char)
+            for char in "0123456789-."
         }
-
+        digits = {ids[char] for char in "0123456789"}
         stop_id = self._single_token(stop_character)
         result = ""
-        for _ in range(64):
-            allowed: set[int] = set()
+
+        for _ in range(128):
+            allowed = set(digits)
 
             if not result:
-                allowed.add(character_ids["-"])
-                for digit in "0123456789":
-                    allowed.add(character_ids[digit])
-
-            elif result == "-":
-                for digit in "0123456789":
-                    allowed.add(character_ids[digit])
-
+                allowed.add(ids["-"])
             elif result in ("0", "-0"):
-                allowed.add(stop_id)
+                allowed = {stop_id}
                 if not integer_only:
-                    allowed.add(character_ids["."])
-
-            elif result.endswith("."):
-                for digit in "0123456789":
-                    allowed.add(character_ids[digit])
-
-            else:
-                for digit in "0123456789":
-                    allowed.add(character_ids[digit])
-                if not integer_only and "." not in result:
-                    allowed.add(character_ids["."])
+                    allowed.add(ids["."])
+            elif result != "-" and not result.endswith("."):
                 allowed.add(stop_id)
+                if not integer_only and "." not in result:
+                    allowed.add(ids["."])
 
-            next_token = self.filter_logits(input_ids, allowed)
+            token = self.filter_logits(input_ids, allowed)
 
-            if next_token == stop_id:
+            if token == stop_id:
                 return result
-            input_ids.append(next_token)
-            for character, token_id in character_ids.items():
-                if token_id == next_token:
-                    result += character
-                    break
+
+            input_ids.append(token)
+            result += next(
+                char for char, token_id in ids.items()
+                if token_id == token
+            )
+
+        raise ValueError("Number generation did not stop.")
 
     def _is_valid_regex(self, pattern: str) -> bool:
         """Check whether a regex pattern is valid."""
@@ -337,9 +327,11 @@ class ConstrainedDecoder(BaseModel):
         function_name: str,
         functions: list[FunctionDefinition],
         input_ids: list[int],
+        prompt: str,
     ) -> dict[str, object]:
         """Generate parameters required by the selected function."""
 
+        number_choices = re.findall(r"-?\d+(?:\.\d+)?", prompt)
         selected = next(
             (f for f in functions if f.name == function_name),
             None,
@@ -360,16 +352,30 @@ class ConstrainedDecoder(BaseModel):
 
             if definition.type in ("number", "float", "integer"):
                 integer_only = definition.type == "integer"
-                number = self.generate_number(
-                    input_ids,
-                    stop_character,
-                    integer_only=integer_only,
-                )
+
+                if number_choices:
+                    number = self.generate_choice(
+                        input_ids,
+                        number_choices,
+                    )
+                    number_choices.remove(number)
+                else:
+                    number = self.generate_number(
+                        input_ids,
+                        stop_character,
+                        integer_only=integer_only,
+                    )
 
                 if integer_only:
                     parameters[name] = int(number)
-                else:
+                elif "." in number:
                     parameters[name] = float(number)
+                else:
+                    integer_value = int(number)
+                    if abs(integer_value) <= 2**53:
+                        parameters[name] = float(number)
+                    else:
+                        parameters[name] = integer_value
 
             elif definition.type == "string":
                 self.force_text('"', input_ids)
@@ -409,14 +415,17 @@ class ConstrainedDecoder(BaseModel):
             suffix='"',
         )
         if function_name == "__no_match__":
-            raise ValueError(
-                f"No available function matches prompt: {prompt!r}"
+            return FunctionCall(
+                prompt=prompt,
+                name="__no_match__",
+                parameters={},
             )
         self.force_text(',"parameters":{', input_ids,)
         parameters = self.generate_parameters(
             function_name,
             functions,
             input_ids,
+            prompt,
         )
         self.force_text("}", input_ids)
 

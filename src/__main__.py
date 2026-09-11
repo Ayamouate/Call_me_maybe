@@ -39,6 +39,8 @@ def main() -> None:
         )
         try:
             result = decoder.decode(prompt_item.prompt, parser.functions)
+            if result.name == "__no_match__":
+                print("  -> no function matches this prompt")
         except Exception as exc:
             print(f"  -> failed, marking as unknown: {exc}")
             result = FunctionCall(
@@ -54,11 +56,6 @@ def main() -> None:
         )
 
     write_results(results, arguments.output)
-
-    # print(
-    #     f"Generated {len(results)} function calls "
-    #     f"in '{arguments.output}'."
-    # )
 
 
 if __name__ == "__main__":

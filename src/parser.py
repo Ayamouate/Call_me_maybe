@@ -50,6 +50,13 @@ class Parser(BaseModel):
                 f"Invalid function definition: {exc}"
             ) from exc
 
+        names = [function.name for function in self.functions]
+        duplicates = {name for name in names if names.count(name) > 1}
+        if duplicates:
+            raise ValueError(
+                f"Duplicate function name(s) found: {sorted(duplicates)}"
+            )
+
     def load_prompts(self, file: str) -> None:
         """Load and validate function-calling prompts."""
 
