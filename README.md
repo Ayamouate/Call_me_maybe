@@ -506,16 +506,19 @@ The goal is to preserve semantic generation by the model while preventing simple
 
 # `__no_match__`
 
-`__no_match__` is an internal reserved value.
+`__no_match__` is an internal reserved value used by the decoder.
 
 It is used when the request does not clearly correspond to any available function.
 
-For example, if none of the available definitions can handle a request, the decoder may return:
+Before results are written, this internal value is converted to `unknown` so
+unmatched prompts have the same output format as other unknown results.
+
+For example, if none of the available definitions can handle a request, the final output contains:
 
 ```json
 {
   "prompt": "Some unrelated request",
-  "name": "__no_match__",
+  "name": "unknown",
   "parameters": {}
 }
 ```

@@ -41,6 +41,11 @@ def main() -> None:
             result = decoder.decode(prompt_item.prompt, parser.functions)
             if result.name == "__no_match__":
                 print("  -> no function matches this prompt")
+                result = FunctionCall(
+                    prompt=prompt_item.prompt,
+                    name="unknown",
+                    parameters={},
+                )
         except Exception as exc:
             print(f"  -> failed, marking as unknown: {exc}")
             result = FunctionCall(

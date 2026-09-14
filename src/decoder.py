@@ -7,6 +7,26 @@ from .llm import build_prompt
 from .models import FunctionCall, FunctionDefinition
 
 
+_MATCH_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "by", "can", "do",
+    "for", "from", "how", "i", "in", "is", "it", "me", "of",
+    "on", "please", "the", "this", "to", "what", "with", "you",
+}
+_MATCH_ALIASES = {
+    "backward": "reverse",
+    "backwards": "reverse",
+    "flip": "reverse",
+    "greeting": "greet",
+    "hello": "greet",
+    "hi": "greet",
+    "plus": "add",
+    "replace": "substitute",
+    "sqrt": "root",
+    "sum": "add",
+    "total": "add",
+}
+
+
 class ConstrainedDecoder(BaseModel):
     """Generate function calls using constrained LLM decoding."""
 
@@ -17,6 +37,35 @@ class ConstrainedDecoder(BaseModel):
     def model_post_init(self, __context: Any) -> None:
         """Initialize the constrained token generator."""
         self._generator = TokenGenerator(model=self.model)
+
+    @staticmethod
+    def _match_terms(text: str) -> set[str]:
+        """Extract meaningful terms used for a conservative match check."""
+
+        words = re.findall(r"[a-z]+", text.lower())
+        return {
+            _MATCH_ALIASES.get(word, word)
+            for word in words
+            if word not in _MATCH_STOP_WORDS
+        }
+
+    def _possible_functions(
+        self,
+        prompt: str,
+        functions: list[FunctionDefinition],
+    ) -> list[FunctionDefinition]:
+        """Keep only functions whose definition relates to the prompt."""
+
+        prompt_terms = self._match_terms(prompt)
+        return [
+            function
+            for function in functions
+            if prompt_terms.intersection(
+                self._match_terms(
+                    f"{function.name} {function.description}"
+                )
+            )
+        ]
 
     def generate_parameters(
         self,
@@ -116,14 +165,22 @@ class ConstrainedDecoder(BaseModel):
                functions: list[FunctionDefinition]) -> FunctionCall:
         """Generate one constrained function call."""
 
-        llm_prompt = build_prompt(prompt, functions)
+        candidate_functions = self._possible_functions(prompt, functions)
+        if not candidate_functions:
+            return FunctionCall(
+                prompt=prompt,
+                name="__no_match__",
+                parameters={},
+            )
+
+        llm_prompt = build_prompt(prompt, candidate_functions)
         input_ids = self._generator.encode(llm_prompt)
 
         self._generator.force_text('{"name":"', input_ids)
 
         function_name = self._generator.generate_choice(
             input_ids,
-            [function.name for function in functions]
+            [function.name for function in candidate_functions]
             + ["__no_match__"],
             suffix='"',
         )
@@ -138,7 +195,7 @@ class ConstrainedDecoder(BaseModel):
 
         parameters = self.generate_parameters(
             function_name,
-            functions,
+            candidate_functions,
             input_ids,
             prompt,
         )
