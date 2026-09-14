@@ -4,24 +4,26 @@
 
 ## Description
 
-**Call Me Maybe** is a function-calling project built around a small language model. Its goal is to translate a natural-language request into a structured function call containing:
+**Call Me Maybe** is a function-calling project built around a small language model.
 
-- the function name to use;
+Its goal is to convert a natural-language request into a structured function call containing:
+
+- the function name to call;
 - the required parameters;
 - parameter values with the correct types.
 
-For example, given a prompt such as:
+For example, given:
 
 ```text
 What is the sum of 2 and 3?
 ```
 
-the program does not calculate the answer itself. Instead, it produces a structured call similar to:
+the program does not calculate the result itself. Instead, it generates a structured function call:
 
 ```json
 {
   "prompt": "What is the sum of 2 and 3?",
-  "name": "add_numbers",
+  "name": "fn_add_numbers",
   "parameters": {
     "a": 2.0,
     "b": 3.0
@@ -29,22 +31,27 @@ the program does not calculate the answer itself. Instead, it produces a structu
 }
 ```
 
-The main objective of the project is to make this generation reliable by using **constrained decoding**. Rather than trusting the model to spontaneously produce correct JSON, the decoder restricts which tokens are allowed at each generation step so that the produced function call follows the expected structure and parameter types.
+The main goal of the project is to make generation reliable using **constrained decoding**.
 
-The project uses the provided `Small_LLM_Model` wrapper with **Qwen/Qwen3-0.6B** as the default model.
+Instead of allowing the language model to freely generate arbitrary text, the decoder restricts which tokens may be selected at each generation step. This helps guarantee valid function names, parameter types, JSON strings, numbers, booleans, and regular expressions.
+
+The project uses the provided `Small_LLM_Model` wrapper with **Qwen/Qwen3-0.6B**.
 
 ---
 
-## Project Structure
+# Project Structure
 
 ```text
 call_me/
 ├── data/
-│   └── input/
-│       ├── functions_definition.json
-│       └── function_calling_tests.json
+│   ├── input/
+│   │   ├── functions_definition.json
+│   │   └── function_calling_tests.json
+│   └── output/
+│       └── function_calling_results.json
 ├── llm_sdk/
 ├── src/
+│   ├── __init__.py
 │   ├── __main__.py
 │   ├── cli.py
 │   ├── decoder.py
@@ -60,114 +67,183 @@ call_me/
 └── README.md
 ```
 
-### Main responsibilities
+## File Responsibilities
 
 | File | Responsibility |
 | --- | --- |
-| `src/__main__.py` | Runs the complete pipeline and handles per-prompt failures. |
-| `src/cli.py` | Parses command-line options and provides default paths. |
+| `src/__main__.py` | Runs the complete function-calling pipeline. |
+| `src/cli.py` | Parses command-line arguments and default paths. |
 | `src/parser.py` | Loads and validates JSON input files. |
-| `src/models.py` | Defines Pydantic models for prompts, function definitions, parameters, and results. |
-| `src/llm.py` | Builds the LLM prompt from the user request and available function definitions. |
-| `src/generator.py` | Implements low-level constrained token generation. |
-| `src/decoder.py` | Coordinates function selection and parameter generation. |
-| `src/output.py` | Creates the output directory and writes valid JSON results. |
+| `src/models.py` | Defines the Pydantic models used by the project. |
+| `src/llm.py` | Builds the prompt sent to the language model. |
+| `src/generator.py` | Performs low-level constrained token generation. |
+| `src/decoder.py` | Selects functions and generates their parameters. |
+| `src/output.py` | Writes generated calls to the output JSON file. |
 
 ---
 
-# Algorithm Explanation
+# How It Works
 
-## 1. Load and validate the inputs
+## 1. Load the Input Files
 
-The program receives two JSON files:
+The program reads:
 
-1. a list of available function definitions;
-2. a list of natural-language prompts.
+1. the available function definitions;
+2. the natural-language prompts to process.
 
-`Parser` loads both files and validates their structure with Pydantic. Invalid JSON, missing files, duplicate function names, empty prompts, and invalid definitions are converted into clear errors instead of causing uncontrolled crashes.
+`Parser` loads the JSON files and validates their content using Pydantic.
 
-Each function definition contains:
+Invalid input such as:
 
-```text
-name
-Description
-parameters
-return type
+- missing files;
+- invalid JSON;
+- duplicate function names;
+- empty prompts;
+- invalid function definitions;
+
+is rejected with a clear error.
+
+A function definition contains information such as:
+
+```json
+{
+  "name": "fn_add_numbers",
+  "description": "Add two numbers",
+  "parameters": {
+    "a": {
+      "type": "number"
+    },
+    "b": {
+      "type": "number"
+    }
+  },
+  "returns": {
+    "type": "number"
+  }
+}
 ```
 
-The decoder therefore does not depend on a fixed list of callable functions: the available functions are read at runtime.
+The decoder therefore works with function definitions provided at runtime instead of depending on a fixed list of functions.
 
-## 2. Build the model prompt
+---
 
-`build_prompt()` provides the model with:
+## 2. Build the LLM Prompt
 
-- the available function definitions;
-- instructions to choose the best matching function;
-- instructions to extract the required argument values;
-- the original user request;
-- the `__no_match__` option when none of the available functions can satisfy the request.
+`build_prompt()` receives:
 
-This prompt gives the model the semantic context it needs, while constrained decoding controls the actual output generation.
+- the user request;
+- the available function definitions.
 
-## 3. Encode the prompt
+It gives the model instructions to:
 
-The prompt is passed to the SDK tokenizer:
+- select the function that matches the request;
+- use `__no_match__` when no function clearly matches;
+- extract the required parameter values;
+- respect JSON string escaping;
+- correctly interpret regex parameters and replacements.
+
+Regex-specific instructions also explain concepts such as:
+
+```text
+numbers  → [0-9]+ or \d+
+vowels   → [aeiouAEIOU]
+word     → \bword\b
+```
+
+The prompt helps the LLM understand the semantic meaning of the request, while constrained decoding controls which outputs can actually be generated.
+
+---
+
+## 3. Encode the Prompt
+
+The completed prompt is converted into token IDs using:
 
 ```python
 model.encode(text)
 ```
 
-The resulting token IDs become the context used for the first generation step.
+These token IDs become the context given to the model.
 
-## 4. Read logits and restrict token choices
+---
 
-For each generated token, `TokenGenerator.filter_logits()` calls:
+## 4. Generate Logits
+
+For each generation step, the project calls:
 
 ```python
 model.get_logits_from_input_ids(input_ids)
 ```
 
-The model returns a score for every token in the vocabulary. Instead of selecting from the whole vocabulary, the decoder creates a set of **allowed token IDs** and chooses only the highest-scoring token inside that set.
+The model returns a score, called a **logit**, for every token in its vocabulary.
+
+Normally an LLM can choose from the complete vocabulary.
+
+In this project, only tokens that satisfy the current constraint are considered.
 
 Conceptually:
 
 ```text
-Prompt
-  ↓
-Token IDs
-  ↓
+User prompt
+    ↓
+Build LLM prompt
+    ↓
+Encode into token IDs
+    ↓
 LLM
-  ↓
-Logits for every possible next token
-  ↓
-Keep only tokens allowed by the current constraint
-  ↓
-Select the highest-scoring valid token
-  ↓
-Append it to the context
-  ↓
+    ↓
+Logits for all vocabulary tokens
+    ↓
+Keep only allowed tokens
+    ↓
+Choose the highest-scoring allowed token
+    ↓
+Append token to context
+    ↓
 Repeat
 ```
 
-This is the core constrained-decoding mechanism used by the project.
+This is the core of the project's **constrained decoding**.
 
-## 5. Constrain function selection
+---
 
-The function name is not chosen with keyword-based `if` statements. The decoder gives the LLM a restricted candidate set containing:
+# Function Selection
+
+The model cannot invent arbitrary function names.
+
+`generate_choice()` receives a fixed candidate list containing:
 
 ```text
-all function names from functions_definition.json
+all function names
 +
 __no_match__
 ```
 
-`generate_choice()` encodes every candidate and progressively removes candidates whose token prefixes no longer match the model's selected tokens.
+For example:
 
-At every step, only token IDs that can still lead to one of the valid candidates are allowed. The model therefore still decides which function is the best semantic match, but it cannot invent a function name that is outside the permitted set.
+```text
+fn_add_numbers
+fn_greet
+fn_reverse_string
+fn_get_square_root
+fn_substitute_string_with_regex
+__no_match__
+```
 
-## 6. Force the JSON structure
+Each candidate is tokenized.
 
-Structural fragments such as:
+During generation, only token IDs that can still lead to one of the available candidates are allowed.
+
+Candidates that no longer match the generated token prefix are removed.
+
+This means the model still decides which function best matches the user's intent, but it cannot output a function that does not exist.
+
+---
+
+# Deterministic JSON Structure
+
+Parts of the result whose content is already known are inserted directly with `force_text()`.
+
+For example:
 
 ```text
 {"name":"
@@ -176,68 +252,293 @@ Structural fragments such as:
 }
 ```
 
-are appended directly through `force_text()`.
+The LLM is therefore responsible for decisions and parameter values, while the decoder controls the fixed JSON structure.
 
-The model is used for decisions and values, while deterministic JSON syntax is inserted by the decoder. This reduces unnecessary generation and prevents the model from corrupting fixed structural parts of the result.
+This reduces malformed output and unnecessary model generation.
 
-## 7. Generate parameters according to their schema
+---
 
-After selecting a function, `ConstrainedDecoder.generate_parameters()` reads the selected function's parameter definitions and generates every required value according to its declared type.
+# Parameter Generation
 
-### Numbers
+After selecting a function, `ConstrainedDecoder` reads its parameter definitions and generates every required value according to its declared type.
 
-Numeric values present in the original request are extracted as candidate values. When such candidates exist, the LLM chooses between them using constrained choice generation instead of freely producing an unlimited sequence of digits.
-
-A generic constrained number generator is also kept as a fallback. It only allows characters that can belong to a valid JSON number:
+Supported parameter types include:
 
 ```text
-0-9
+number
+float
+integer
+string
+boolean
+```
+
+---
+
+## Numbers
+
+Numbers already present in the user prompt are extracted and used as candidates.
+
+For example:
+
+```text
+What is the sum of 265 and 345?
+```
+
+produces candidates:
+
+```text
+265
+345
+```
+
+The model then chooses between those values using constrained generation.
+
+The number extraction supports:
+
+```text
+12
+-12
+12.5
+-12.5
+.3
+-.3
+```
+
+Leading-decimal forms can be normalized before conversion:
+
+```text
+.3   → 0.3
+-.3  → -0.3
+```
+
+A constrained number generator is also available as a fallback when no numeric candidate can be extracted from the request.
+
+It restricts generation to characters that can belong to a valid number:
+
+```text
+0 1 2 3 4 5 6 7 8 9
 -
 .
 ```
 
-and the appropriate delimiter when the number may legally stop.
+---
 
-For JSON `number` parameters, ordinary whole values are represented as floats when safely representable, which preserves expected results such as:
+## Number Precision
+
+For regular JSON `number` parameters, whole numbers are normally converted to floats:
 
 ```text
 2 → 2.0
 ```
 
-Very large whole numbers are kept as Python integers when conversion to a float would risk precision loss, for example:
+However, very large integers are kept as integers if converting them to a float could lose precision.
+
+For example:
 
 ```text
-64646464646464646 → 64646464646464646
+64646464646464646
 ```
 
-### Integers
+remains:
 
-When the declared type is `integer`, decimal points are not allowed and the generated value is converted to `int`.
+```text
+64646464646464646
+```
 
-### Booleans
+instead of being converted to an imprecise floating-point value.
 
-Boolean parameters are restricted to exactly:
+---
+
+## Integers
+
+For parameters declared as:
+
+```json
+{
+  "type": "integer"
+}
+```
+
+the final value is converted to Python `int`.
+
+Decimal values are not used for integer parameters.
+
+---
+
+## Booleans
+
+Boolean generation is restricted to exactly:
 
 ```text
 true
 false
 ```
 
-The selected value is then converted to a Python boolean.
+The selected JSON value is converted to a Python boolean:
 
-### Strings
+```python
+True
+False
+```
 
-String generation uses the model vocabulary to build a cache of tokens that are safe inside a JSON string. Tokens containing invalid control characters, an unescaped quote, an unescaped backslash, or the replacement character are excluded.
+---
 
-The decoder also handles valid JSON escape sequences when a backslash is generated.
+# String Generation
 
-### Regex strings
+String values are generated using a filtered set of tokens from the model vocabulary.
 
-Regex parameters use constrained string generation with additional validation through Python's `re` module. Intermediate patterns are checked with `re.compile()`, and the generator keeps track of valid candidates so that it can return a concise valid regular expression.
+`TokenGenerator` creates a cache containing only tokens that are safe inside a JSON string.
 
-## 8. Produce the final result
+Tokens are rejected when they contain:
 
-Each successful generation is stored as a `FunctionCall` object containing exactly:
+- unescaped quotes;
+- unescaped backslashes;
+- invalid control characters;
+- Unicode replacement characters.
+
+JSON escape sequences are handled separately when the model generates a backslash.
+
+---
+
+## Replacement Strings
+
+Replacement parameters receive additional handling for repeated symbol tokens.
+
+A tokenizer may contain a token such as:
+
+```text
+**
+```
+
+even when the intended replacement is:
+
+```text
+*
+```
+
+The generator detects repeated punctuation-only tokens and reduces them when appropriate.
+
+For example:
+
+```text
+Replace vowels with asterisks
+```
+
+should generate:
+
+```json
+{
+  "replacement": "*"
+}
+```
+
+rather than:
+
+```json
+{
+  "replacement": "**"
+}
+```
+
+---
+
+# Regex Generation
+
+Regex parameters are generated with additional constraints.
+
+The generator:
+
+1. generates regex text from safe tokens;
+2. checks intermediate patterns with Python's `re` module;
+3. remembers valid regex candidates;
+4. stops when a concise valid regex is complete;
+5. performs a small repair step when the generated expression is structurally valid but does not match the source string.
+
+Regex syntax is checked using:
+
+```python
+re.compile(pattern)
+```
+
+The generated expression can also be tested against the source string using:
+
+```python
+re.search(pattern, source_string)
+```
+
+For example, if the model produces:
+
+```text
+aeiouAEIOU
+```
+
+for a vowel replacement request, the expression is syntactically valid but does not match:
+
+```text
+Programming is fun
+```
+
+The generator can interpret the sequence as a character set:
+
+```text
+[aeiouAEIOU]
+```
+
+which correctly matches individual vowels.
+
+Similarly:
+
+```text
+[0-9]+
+```
+
+is a valid equivalent of:
+
+```text
+\d+
+```
+
+for matching sequences of digits.
+
+The goal is to preserve semantic generation by the model while preventing simple malformed regex results from reaching the final function call.
+
+---
+
+# `__no_match__`
+
+`__no_match__` is an internal reserved value.
+
+It is used when the request does not clearly correspond to any available function.
+
+For example, if none of the available definitions can handle a request, the decoder may return:
+
+```json
+{
+  "prompt": "Some unrelated request",
+  "name": "__no_match__",
+  "parameters": {}
+}
+```
+
+Function definitions are not allowed to use `__no_match__` as a real function name.
+
+---
+
+# Error Handling
+
+Each prompt is processed independently.
+
+If generation unexpectedly fails for one prompt, the program records a fallback result and continues processing the remaining prompts instead of terminating the entire batch.
+
+This prevents one problematic request from cancelling all other function calls.
+
+Input parsing and output writing also convert common file errors into readable `ValueError` messages.
+
+---
+
+# Output
+
+Each result is represented by a `FunctionCall` containing:
 
 ```text
 prompt
@@ -245,76 +546,137 @@ name
 parameters
 ```
 
-The complete list is serialized with `json.dump()` to the configured output file.
+Example:
+
+```json
+{
+  "prompt": "Greet shrek",
+  "name": "fn_greet",
+  "parameters": {
+    "name": "shrek"
+  }
+}
+```
+
+The complete result list is written as JSON to:
+
+```text
+data/output/function_calling_results.json
+```
+
+by default.
 
 ---
 
 # Design Decisions
 
-## Separate decoder and token generator
+## Constrained Decoding Instead of Free Generation
 
-The project separates high-level schema logic from low-level token generation:
+The project does not ask the model to freely generate the complete result.
 
-- `ConstrainedDecoder` decides **what** must be generated: function name, parameter order, and expected parameter type.
-- `TokenGenerator` decides **how** valid values are generated from model logits under constraints.
+Free generation could produce:
 
-This keeps the decoder easier to understand and makes the constrained-generation utilities reusable.
+- invalid JSON;
+- nonexistent function names;
+- wrong parameter types;
+- unnecessary explanations;
+- malformed values.
 
-## Use the LLM for semantic selection
-
-Function selection remains an LLM decision. The implementation does not choose functions by checking for hardcoded keywords in the user prompt. Constraints only limit the model to valid function names.
-
-## Force deterministic structure
-
-Known JSON syntax is inserted directly instead of spending model-generation steps on characters whose value is already known. This improves reliability and reduces the number of opportunities for malformed output.
-
-## Dynamic function definitions
-
-Functions and their parameter schemas are loaded from `functions_definition.json`. The main pipeline therefore works from supplied definitions instead of embedding the provided demonstration functions directly into the main application flow.
-
-## Explicit no-match behavior
-
-`__no_match__` is reserved as an internal sentinel. It lets the LLM express that none of the supplied functions can satisfy a prompt instead of forcing an unrelated function call.
-
-## Per-prompt failure isolation
-
-If an unexpected error occurs while generating one prompt, the main loop records that item as:
-
-```json
-{
-  "name": "unknown",
-  "parameters": {}
-}
-```
-
-and continues processing the remaining prompts. This prevents a single edge case from cancelling an entire batch.
-
-## Pydantic validation
-
-Pydantic is used for project data models so malformed prompt objects, function definitions, duplicated/reserved names, and invalid field shapes are detected before decoding begins.
+Constrained decoding reduces these possibilities by controlling the available tokens during generation.
 
 ---
 
-# Instructions
+## Separate Decoder and Generator
+
+The implementation separates two responsibilities.
+
+### `ConstrainedDecoder`
+
+Responsible for **what** needs to be generated:
+
+- selecting a function;
+- reading its schema;
+- deciding parameter order;
+- determining the expected parameter type.
+
+### `TokenGenerator`
+
+Responsible for **how** values are generated:
+
+- token filtering;
+- constrained choices;
+- numbers;
+- strings;
+- booleans;
+- regex patterns.
+
+This keeps the architecture easier to understand and maintain.
+
+---
+
+## LLM-Based Semantic Decisions
+
+The model is still responsible for understanding the user's request.
+
+Function selection is not implemented with code such as:
+
+```python
+if "sum" in prompt:
+    function = "fn_add_numbers"
+```
+
+Instead, the model chooses between valid function-name candidates according to its logits.
+
+Constraints guarantee structural validity without completely replacing the semantic role of the LLM.
+
+---
+
+## Dynamic Function Definitions
+
+The application loads available functions from:
+
+```text
+functions_definition.json
+```
+
+rather than hardcoding the public-test functions into the main decoding pipeline.
+
+This makes the decoder reusable with other compatible function definitions.
+
+---
+
+## Pydantic Validation
+
+Pydantic models are used to validate:
+
+- prompts;
+- parameter definitions;
+- return definitions;
+- function definitions;
+- generated function calls.
+
+Invalid structures are detected before decoding begins.
+
+---
+
+# Installation
 
 ## Requirements
 
-- Python **3.10 or later**
+- Python 3.10 or later
 - `uv`
-- Internet access the first time the model weights are downloaded
+- Internet access when model files need to be downloaded
 
-The project uses the local `llm_sdk` workspace package included in the repository.
+The project includes the local `llm_sdk` workspace package.
 
-## Installation
-
-Clone the repository and enter the project directory:
+Clone the repository:
 
 ```bash
-git clone <your-repository-url>
+git clone <repository-url>
 cd call_me
 ```
 
-Install and synchronize dependencies:
+Install dependencies:
 
 ```bash
 make install
@@ -326,7 +688,11 @@ Equivalent command:
 uv sync
 ```
 
-## Run with the default files
+---
+
+# Usage
+
+## Run With Default Files
 
 ```bash
 make run
@@ -338,314 +704,151 @@ Equivalent command:
 uv run python -m src
 ```
 
-By default, the program reads:
+The default files are:
 
 ```text
 data/input/functions_definition.json
 data/input/function_calling_tests.json
-```
-
-and writes:
-
-```text
 data/output/function_calling_results.json
 ```
 
-The output directory is created automatically and is ignored by Git.
+---
 
-## Run with custom files
+## Command-Line Options
+
+Display available arguments:
+
+```bash
+uv run python -m src --help
+```
+
+Custom files can be supplied using the CLI options defined in `src/cli.py`.
+
+Example:
 
 ```bash
 uv run python -m src \
-  --functions_definition path/to/functions.json \
-  --input path/to/prompts.json \
-  --output path/to/results.json
+    --functions_definition data/input/functions_definition.json \
+    --input data/input/function_calling_tests.json \
+    --output data/output/function_calling_results.json
 ```
 
-## Lint and type checking
+---
+
+# Makefile Commands
+
+Install dependencies:
 
 ```bash
-make lint
+make install
 ```
 
-This runs `flake8` and `mypy` on the source code with the project's configured checks.
-
-## Clean caches
-
-```bash
-make clean
-```
-
-This removes Python, mypy, and pytest cache directories.
-
----
-
-# Input Format
-
-## Function definitions
-
-Example:
-
-```json
-[
-  {
-    "name": "add_numbers",
-    "description": "Add two numbers together and return their sum.",
-    "parameters": {
-      "a": {"type": "number"},
-      "b": {"type": "number"}
-    },
-    "returns": {
-      "type": "number"
-    }
-  }
-]
-```
-
-## Prompt file
-
-Example:
-
-```json
-[
-  {
-    "prompt": "What is the sum of 2 and 3?"
-  },
-  {
-    "prompt": "Greet shrek"
-  }
-]
-```
-
----
-
-# Output Format
-
-The generated output is a JSON array. Every result contains:
-
-- `prompt`: the original request;
-- `name`: the selected function name;
-- `parameters`: the generated argument object.
-
-Example:
-
-```json
-[
-  {
-    "prompt": "What is the sum of 2 and 3?",
-    "name": "add_numbers",
-    "parameters": {
-      "a": 2.0,
-      "b": 3.0
-    }
-  }
-]
-```
-
----
-
-# Example Usage
-
-Running:
+Run the project:
 
 ```bash
 make run
 ```
 
-produces console progress similar to:
-
-```text
-Processing 1/11: What is the sum of 2 and 3?
-
-Result:
-
-Function name: add_numbers
-Parameters: {'a': 2.0, 'b': 3.0}
-```
-
-The complete machine-readable result is written to:
-
-```text
-data/output/function_calling_results.json
-```
-
-Another example using explicit paths:
+Run with Python debugger:
 
 ```bash
-uv run python -m src \
-  --functions_definition data/input/functions_definition.json \
-  --input data/input/function_calling_tests.json \
-  --output data/output/function_calling_results.json
+make debug
 ```
 
----
-
-# Performance Analysis
-
-On the current development environment and the provided 11-prompt test set:
-
-- **Accuracy:** 11/11 expected function calls and arguments are produced correctly.
-- **Observed runtime:** approximately **4 minutes** for the full test set after model startup/download requirements are satisfied.
-- **JSON reliability:** result serialization is handled by Python's `json` module, while constrained decoding prevents the model from freely generating the fixed JSON structure.
-- **Failure isolation:** an error on one prompt does not terminate processing of the remaining prompts.
-
-These measurements describe the current local test environment and supplied test set; performance can vary depending on hardware, model cache state, and the complexity of alternative function definitions or prompts.
-
-The largest runtime cost comes from repeated LLM inference during token-by-token constrained generation. The project favors correctness and controlled output over unconstrained generation speed.
-
----
-
-# Challenges Faced
-
-## Reliable JSON from a small LLM
-
-A small language model can understand the task but may produce extra prose, malformed JSON, invalid function names, or values with the wrong type when left unconstrained.
-
-**Solution:** fixed JSON fragments are forced directly, while generated parts are limited to schema-compatible tokens and candidates.
-
-## Choosing a valid function without hardcoding the answer
-
-Function names must remain an LLM decision, but the model must not invent names.
-
-**Solution:** `generate_choice()` keeps only token prefixes belonging to the available function names plus the reserved no-match sentinel.
-
-## Numeric generation that does not terminate
-
-Allowing every digit after every generated digit can make the model prefer another number token indefinitely rather than choosing the delimiter.
-
-**Solution:** numeric values found in the user request are used as constrained candidates when available, while a bounded generic number generator remains as a fallback.
-
-## Large-number precision
-
-Converting every JSON `number` directly to `float` can change very large integer values or display them in scientific notation.
-
-**Solution:** safely representable whole numbers remain compatible with float output such as `2.0`, while very large whole values are kept as integers to preserve their exact value.
-
-## Safe JSON strings
-
-Normal vocabulary tokens can contain characters that would break a JSON string.
-
-**Solution:** the generator builds a safe-token vocabulary, excludes unsafe token text, and explicitly handles JSON escape sequences.
-
-## Regex generation
-
-A partially generated regular expression may be syntactically invalid or may continue into unnecessary repeated alternatives.
-
-**Solution:** patterns are checked incrementally with `re.compile()`, a last valid pattern is retained, and stopping rules are used to keep generated regex values concise.
-
-## Keeping the decoder maintainable
-
-The original decoding logic became large because function selection, token filtering, number generation, string escaping, and regex generation were all related but distinct responsibilities.
-
-**Solution:** the implementation was split into `ConstrainedDecoder` for high-level schema orchestration and `TokenGenerator` for low-level constrained generation.
-
----
-
-# Testing Strategy
-
-The implementation is validated in several layers.
-
-## Provided functional test set
-
-The current input file contains **11 prompts** covering:
-
-- addition;
-- greetings;
-- string reversal;
-- square roots;
-- regex-based substitutions.
-
-The current implementation produces the expected function selection and parameters for **11/11** of these prompts.
-
-## Input-validation tests
-
-The parser and Pydantic models are designed to reject or report:
-
-- missing files;
-- invalid JSON;
-- permission/read errors;
-- non-array top-level input;
-- malformed function definitions;
-- duplicate function names;
-- the reserved `__no_match__` function name;
-- empty prompts;
-- empty parameter names.
-
-## Generation edge cases
-
-During development, the decoder was tested against cases involving:
-
-- large numeric values;
-- floats and integers;
-- strings requiring JSON-safe generation;
-- regex patterns;
-- function definitions with different parameter types;
-- prompts that do not match an available function;
-- per-prompt generation failures.
-
-## Static checks
-
-Run:
+Run static checks:
 
 ```bash
 make lint
 ```
 
-to apply `flake8` and `mypy` checks to the source code.
+Remove Python cache directories:
 
-## Manual output validation
-
-After a run, `data/output/function_calling_results.json` should be checked for:
-
-1. valid JSON syntax;
-2. one result object per input prompt;
-3. correct `prompt`, `name`, and `parameters` keys;
-4. correct argument names;
-5. correct argument types;
-6. correct function selection and extracted values.
+```bash
+make clean
+```
 
 ---
 
-# Error Handling
+# Testing
 
-The program is designed to report clear failures instead of crashing without context.
+Run the project first:
 
-Examples include:
+```bash
+make run
+```
 
-- missing or unreadable input files;
-- invalid JSON;
-- invalid Pydantic input models;
-- missing functions or prompts;
-- unsupported parameter types;
-- invalid tokenizer results;
-- empty constrained-token sets;
-- number generation that fails to terminate;
-- regex generation that cannot produce a valid pattern;
-- output-file write errors.
+Then grade the generated output with the provided public grader:
 
-At the top level, fatal setup errors are printed as a clear `Error:` message. During batch decoding, an individual generation failure is isolated so the remaining prompts can still be processed.
+```bash
+uv run python -m moulinette grade_student_answers \
+    data/output/function_calling_results.json \
+    --set public
+```
+
+Equivalent regex expressions may differ from the reference representation while still producing the correct function result.
+
+For example:
+
+```text
+[0-9]+
+```
+
+and:
+
+```text
+\d+
+```
+
+both match one or more digits.
+
+Likewise, a simpler regex may still be accepted when its evaluated function output is equivalent to the expected result.
 
 ---
 
-# Resources
+# Example Pipeline
 
-The following resources were useful for understanding the concepts used in this project:
+For:
 
-- Python documentation — `json`: https://docs.python.org/3/library/json.html
-- Python documentation — `argparse`: https://docs.python.org/3/library/argparse.html
-- Python documentation — `re`: https://docs.python.org/3/library/re.html
-- Pydantic documentation: https://docs.pydantic.dev/
-- Qwen3-0.6B model card: https://huggingface.co/Qwen/Qwen3-0.6B
-- Hugging Face LLM course — tokenizers: https://huggingface.co/learn/llm-course/
-- JSON specification: https://www.json.org/json-en.html
+```text
+Replace all vowels in 'Programming is fun' with asterisks
+```
 
-The project subject and the provided `llm_sdk` wrapper were also primary references for the required generation pipeline and SDK interface.
+the complete process is conceptually:
 
-## Use of AI
+```text
+User request
+      ↓
+Build prompt with available functions
+      ↓
+Encode prompt
+      ↓
+Model generates logits
+      ↓
+Constrained function-name selection
+      ↓
+fn_substitute_string_with_regex
+      ↓
+Generate parameters according to schema
+      ↓
+source_string = "Programming is fun"
+regex = "[aeiouAEIOU]"
+replacement = "*"
+      ↓
+Create FunctionCall
+      ↓
+Write JSON output
+```
 
-AI tools were used as a learning and development aid during the project. In particular, AI was used to:
+Final result:
 
-- clarify how tokenization, input IDs, logits, and next-token selection work;
-- explain constrained decoding and function-calling concepts;
-- help reason about edge cases in number, string, and regex generation;
-- debug errors observed during development;
+```json
+{
+  "prompt": "Replace all vowels in 'Programming is fun' with asterisks",
+  "name": "fn_substitute_string_with_regex",
+  "parameters": {
+    "source_string": "Programming is fun",
+    "regex": "[aeiouAEIOU]",
+    "replacement": "*"
+  }
+}
+```

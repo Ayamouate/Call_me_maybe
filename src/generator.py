@@ -62,6 +62,9 @@ class TokenGenerator(BaseModel):
         }
         generated: list[int] = []
         while candidates:
+            # Early exit: if only one candidate remains, return it
+            if len(candidates) == 1:
+                return next(iter(candidates.keys()))
             allowed_tokens: set[int] = set()
             for tokens in candidates.values():
                 if len(generated) < len(tokens):
@@ -174,7 +177,30 @@ class TokenGenerator(BaseModel):
 
         return False
 
-    def generate_regex(self, input_ids: list[int]) -> str:
+    def _repair_regex(
+        self,
+        pattern: str,
+        source_string: str,
+    ) -> str:
+        """Repair simple malformed regex semantics."""
+
+        if re.search(pattern, source_string):
+            return pattern
+        if (
+            pattern.isalpha()
+            and len(pattern) > 1
+        ):
+            character_class = f"[{pattern}]"
+
+            if re.search(character_class, source_string):
+                return character_class
+        return pattern
+
+    def generate_regex(
+        self,
+        input_ids: list[int],
+        source_string: str,
+    ) -> str:
         """Generate a short valid regex string."""
 
         content_tokens = self._get_safe_string_tokens()
@@ -195,7 +221,10 @@ class TokenGenerator(BaseModel):
             if next_token == quote_id:
                 value = self._decode_json_string(encoded)
                 if self._is_valid_regex(value):
-                    return value
+                    return self._repair_regex(
+                        value,
+                        source_string,
+                    )
                 break
             if next_token == backslash_id:
                 input_ids.append(next_token)
@@ -212,7 +241,10 @@ class TokenGenerator(BaseModel):
                 current = self._decode_json_string(encoded)
 
                 if self._should_stop_regex(current, text):
-                    return current
+                    return self._repair_regex(
+                        current,
+                        source_string,
+                    )
 
                 input_ids.append(next_token)
                 encoded += text
@@ -220,7 +252,10 @@ class TokenGenerator(BaseModel):
             if self._is_valid_regex(value):
                 last_valid = value
         if last_valid:
-            return last_valid
+            return self._repair_regex(
+                last_valid,
+                source_string,
+            )
         raise ValueError("Could not generate a valid regex.")
 
     def _get_safe_string_tokens(self) -> dict[int, str]:
@@ -291,6 +326,20 @@ class TokenGenerator(BaseModel):
             if next_token != backslash_id:
                 text = content_tokens[next_token]
                 current = self._decode_json_string(encoded)
+
+                if (
+                    stop_symbol_tail
+                    and not current
+                    and len(text) > 1
+                    and len(set(text)) == 1
+                    and all(
+                        not char.isalnum() and not char.isspace()
+                        for char in text
+                    )
+                ):
+                    symbol = text[0]
+                    self.force_text(symbol, input_ids)
+                    return symbol
 
                 if (
                     stop_symbol_tail

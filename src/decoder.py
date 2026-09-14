@@ -27,7 +27,16 @@ class ConstrainedDecoder(BaseModel):
     ) -> dict[str, object]:
         """Generate parameters required by the selected function."""
 
-        number_choices = re.findall(r"-?\d+(?:\.\d+)?", prompt)
+        number_choices = re.findall(r"-?(?:\d+(?:\.\d+)?|\.\d+)", prompt)
+        number_choices = [
+            "-0" + value[1:]
+            if value.startswith("-.")
+            else "0" + value
+            if value.startswith(".")
+            else value
+            for value in number_choices
+        ]
+
         selected = next(
             (f for f in functions if f.name == function_name),
             None,
@@ -78,7 +87,11 @@ class ConstrainedDecoder(BaseModel):
             elif definition.type == "string":
                 self._generator.force_text('"', input_ids)
                 if name == "regex":
-                    value = self._generator.generate_regex(input_ids)
+                    source_string = parameters.get("source_string", "")
+                    value = self._generator.generate_regex(
+                        input_ids,
+                        str(source_string),
+                    )
                 else:
                     value = self._generator.generate_string(
                         input_ids,
