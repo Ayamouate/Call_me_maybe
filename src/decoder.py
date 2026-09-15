@@ -12,19 +12,6 @@ _MATCH_STOP_WORDS = {
     "for", "from", "how", "i", "in", "is", "it", "me", "of",
     "on", "please", "the", "this", "to", "what", "with", "you",
 }
-_MATCH_ALIASES = {
-    "backward": "reverse",
-    "backwards": "reverse",
-    "flip": "reverse",
-    "greeting": "greet",
-    "hello": "greet",
-    "hi": "greet",
-    "plus": "add",
-    "replace": "substitute",
-    "sqrt": "root",
-    "sum": "add",
-    "total": "add",
-}
 
 
 class ConstrainedDecoder(BaseModel):
@@ -44,7 +31,7 @@ class ConstrainedDecoder(BaseModel):
 
         words = re.findall(r"[a-z]+", text.lower())
         return {
-            _MATCH_ALIASES.get(word, word)
+            word
             for word in words
             if word not in _MATCH_STOP_WORDS
         }

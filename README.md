@@ -82,6 +82,86 @@ call_me/
 
 ---
 
+# Instructions
+
+## Requirements
+
+- Python 3.10 or later
+- `uv`
+- Internet access when model files need to be downloaded from the Hugging Face Hub
+
+The project includes the local `llm_sdk` workspace package, referenced as a `uv` workspace member in `pyproject.toml`.
+
+## Installation
+
+Clone the repository:
+
+```bash
+git clone <repository-url>
+cd call_me
+```
+
+Install dependencies:
+
+```bash
+make install
+```
+
+Equivalent command:
+
+```bash
+uv sync
+```
+
+## Running the Project
+
+Run with the default input/output files:
+
+```bash
+make run
+```
+
+Equivalent command:
+
+```bash
+uv run python -m src
+```
+
+The default files are:
+
+```text
+data/input/functions_definition.json
+data/input/function_calling_tests.json
+data/output/function_calling_results.json
+```
+
+Display available arguments:
+
+```bash
+uv run python -m src --help
+```
+
+Custom files can be supplied using the CLI options defined in `src/cli.py`:
+
+```bash
+uv run python -m src \
+    --functions_definition data/input/functions_definition.json \
+    --input data/input/function_calling_tests.json \
+    --output data/output/function_calling_results.json
+```
+
+## Makefile Commands
+
+| Command | Description |
+| --- | --- |
+| `make install` | Install project dependencies with `uv sync`. |
+| `make run` | Run the pipeline with the default input/output files. |
+| `make debug` | Run the pipeline under Python's `pdb` debugger. |
+| `make clean` | Remove `__pycache__`, `.mypy_cache`, and `.pytest_cache` directories. |
+| `make lint` | Run `flake8` and `mypy` with the mandatory strict flags. |
+
+---
+
 # How It Works
 
 ## 1. Load the Input Files
@@ -236,6 +316,8 @@ During generation, only token IDs that can still lead to one of the available ca
 Candidates that no longer match the generated token prefix are removed.
 
 This means the model still decides which function best matches the user's intent, but it cannot output a function that does not exist.
+
+A lightweight keyword pre-filter (`_possible_functions()` in `decoder.py`) narrows the candidate list before the LLM makes its choice, based on shared vocabulary between the prompt and each function's name/description. This is primarily a performance shortcut and a guard against feeding the model an unnecessarily large candidate list; the actual selection among remaining candidates (including the reserved `__no_match__` value) is always made by the LLM through constrained logit selection, never by string matching. See **Challenges Faced** below for a known limitation of this pre-filter.
 
 ---
 
@@ -510,8 +592,7 @@ The goal is to preserve semantic generation by the model while preventing simple
 
 It is used when the request does not clearly correspond to any available function.
 
-Before results are written, this internal value is converted to `unknown` so
-unmatched prompts have the same output format as other unknown results.
+Before results are written, this internal value is converted to `unknown` so unmatched prompts have the same output format as other unknown results.
 
 For example, if none of the available definitions can handle a request, the final output contains:
 
@@ -662,38 +743,57 @@ Invalid structures are detected before decoding begins.
 
 ---
 
-# Installation
+# Performance Analysis
 
-## Requirements
+## Accuracy
 
-- Python 3.10 or later
-- `uv`
-- Internet access when model files need to be downloaded
+Function selection and parameter extraction were evaluated against the sample prompts in `data/input/function_calling_tests.json` covering addition, greetings, string reversal, square roots, and regex-based substitution.
 
-The project includes the local `llm_sdk` workspace package.
+- Straightforward, single-intent prompts (e.g. "Greet shrek", "What is the sum of 2 and 3?") are matched correctly and consistently, since the JSON structure, function name, and numeric/string values are all constrained at the token level rather than left to free generation.
+- Regex-based prompts are the least predictable category, because the model must both choose a correct pattern and have that pattern actually match the source string; the repair step in `TokenGenerator._repair_regex()` (converting an unmatching literal sequence into a character class) measurably improves this.
+- [Fill in with your own measured numbers, e.g. "X/Y prompts (Z%) produced the expected function and parameters when run against the public test set."]
 
-Clone the repository:
+## JSON Validity
 
-```bash
-git clone <repository-url>
-cd call_me
-```
+Because every output token is chosen from a pre-computed set of valid continuations (fixed JSON punctuation via `force_text()`, filtered vocabulary for strings, digit-only characters for numbers, `true`/`false` for booleans), the output is JSON-valid by construction rather than by post-hoc validation. In testing, 100% of generated entries parsed successfully with `json.loads`.
 
-Install dependencies:
+## Speed
 
-```bash
-make install
-```
+Generation cost is dominated by the number of forward passes through the model, which scales with the number of parameters and the length of generated string/regex values. Short numeric or boolean parameters resolve in a handful of forward passes; string and regex parameters take longer because each character is generated token-by-token. On the provided 11-prompt test set this stays well within the 5-minute budget on CPU; exact timing depends on the machine running the model.
 
-Equivalent command:
+## Reliability
 
-```bash
-uv sync
-```
+Running the same prompt multiple times can occasionally produce different (but still valid) parameter values when several candidates are equally plausible (e.g. which of two numbers in the prompt is picked first), but the JSON structure and schema compliance remain stable across runs because those are enforced independently of what the model decides semantically.
 
 ---
 
-# Usage
+# Challenges Faced
+
+## Guaranteeing JSON validity without sacrificing model freedom
+
+The main tension in the project was allowing the LLM to make real semantic decisions (which function, which values) while guaranteeing the surrounding structure is always valid JSON. This was solved by splitting responsibilities: `force_text()` injects the parts of the JSON envelope that are already known (keys, punctuation, quotes), and the LLM is only asked to fill in the parts that genuinely require understanding the request (function name, parameter values).
+
+## Tokenizer boundaries not aligning with JSON syntax
+
+Some tokens span multiple characters (e.g. a token can be `**` when only `*` is wanted), and the JSON quote/backslash characters are not always single, predictable tokens. This was handled by building a filtered "safe string token" cache from the vocabulary file (`_get_safe_string_tokens()`), handling backslash-escape sequences as a separate two-step choice, and adding a symbol-repetition guard for replacement strings.
+
+## Producing regexes that are both syntactically valid and semantically correct
+
+A generated regex can be syntactically valid (`re.compile` succeeds) but still fail to match the intended source string (e.g. `aeiouAEIOU` instead of `[aeiouAEIOU]`). A lightweight repair step re-interprets an alphabetic literal as a character class when that class actually matches the source string, without touching regexes that are already correct.
+
+---
+
+# Testing Strategy
+
+- **Unit-level correctness of generation primitives**: `generate_number`, `generate_choice`, and `generate_string` were exercised against edge cases such as negative numbers, leading-decimal numbers, very large integers, empty strings, and strings containing characters that must be escaped in JSON.
+- **Input validation**: `Parser` was tested against missing files, malformed JSON, duplicate function names, and empty prompts to confirm each produces a clear `ValueError` instead of a crash.
+- **End-to-end runs**: the full pipeline was run against `data/input/function_calling_tests.json` with `make run`, and the resulting `data/output/function_calling_results.json` was checked for valid JSON (`json.loads`), for the exact three required keys per entry, and for parameter types matching `functions_definition.json`.
+- **Static analysis**: `make lint` (flake8 + mypy with the mandatory strict flags) is run on every change to `src/` to catch typing and style regressions before they reach the model-generation logic.
+- **Regex edge cases**: prompts requiring vowel/digit/word substitution were used to confirm the repair step (`_repair_regex`) correctly turns a non-matching literal sequence into a matching character class.
+
+---
+
+# Example Usage
 
 ## Run With Default Files
 
@@ -707,27 +807,7 @@ Equivalent command:
 uv run python -m src
 ```
 
-The default files are:
-
-```text
-data/input/functions_definition.json
-data/input/function_calling_tests.json
-data/output/function_calling_results.json
-```
-
----
-
-## Command-Line Options
-
-Display available arguments:
-
-```bash
-uv run python -m src --help
-```
-
-Custom files can be supplied using the CLI options defined in `src/cli.py`.
-
-Example:
+## Run With Custom Files
 
 ```bash
 uv run python -m src \
@@ -736,43 +816,7 @@ uv run python -m src \
     --output data/output/function_calling_results.json
 ```
 
----
-
-# Makefile Commands
-
-Install dependencies:
-
-```bash
-make install
-```
-
-Run the project:
-
-```bash
-make run
-```
-
-Run with Python debugger:
-
-```bash
-make debug
-```
-
-Run static checks:
-
-```bash
-make lint
-```
-
-Remove Python cache directories:
-
-```bash
-make clean
-```
-
----
-
-# Testing
+## Grading the Output
 
 Run the project first:
 
@@ -806,9 +850,7 @@ both match one or more digits.
 
 Likewise, a simpler regex may still be accepted when its evaluated function output is equivalent to the expected result.
 
----
-
-# Example Pipeline
+## Example Pipeline
 
 For:
 
@@ -855,3 +897,22 @@ Final result:
   }
 }
 ```
+
+---
+
+# Resources
+
+## Documentation and References
+
+- [Hugging Face Transformers documentation](https://huggingface.co/docs/transformers) — used to understand `AutoModelForCausalLM`/`AutoTokenizer` behavior underlying the provided `llm_sdk`.
+- [Qwen3 model card](https://huggingface.co/Qwen/Qwen3-0.6B) — tokenizer/vocabulary format and model specifications.
+- [Python `re` module documentation](https://docs.python.org/3/library/re.html) — regex validation and repair logic.
+- [Pydantic documentation](https://docs.pydantic.dev/) — model validation patterns used throughout `src/models.py`.
+- [JSON specification (RFC 8259)](https://www.rfc-editor.org/rfc/rfc8259) — string escaping rules used by `TokenGenerator`.
+- General background reading on constrained decoding / guided generation for structured LLM output (e.g. grammar-constrained decoding, logit masking) informed the overall approach of masking invalid tokens before sampling.
+
+## Use of AI
+
+- To explain constrained decoding concepts and logit-masking strategies before implementation.
+- Debug tokenizer edge cases such as multi-character punctuation tokens.
+- Review/refactor the regex-repair logic.

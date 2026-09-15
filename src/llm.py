@@ -22,7 +22,6 @@ def build_prompt(user_prompt: str, functions: list[FunctionDefinition]) -> str:
         "- The regex parameter describes WHAT TO MATCH.\n"
         "- The replacement parameter describes WHAT TO INSERT.\n"
         "- The substitution function already replaces ALL regex matches.\n"
-        "- To match vowels, use [aeiouAEIOU].\n"
         "- The replacement is inserted once for EACH match.\n"
 
         "Return a JSON object with 'name' and 'parameters'.\n\n"

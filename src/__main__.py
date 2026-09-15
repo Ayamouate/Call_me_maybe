@@ -1,14 +1,15 @@
+import sys
 from .parser import Parser
-from llm_sdk import Small_LLM_Model
-from .models import FunctionCall
-from .decoder import ConstrainedDecoder
 from .output import write_results
 from .cli import parse_arguments
-import sys
 
 
 def main() -> None:
     """Run the function-calling pipeline."""
+
+    from llm_sdk import Small_LLM_Model
+    from .models import FunctionCall
+    from .decoder import ConstrainedDecoder
 
     arguments = parse_arguments()
     parser = Parser()
@@ -66,6 +67,9 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (Exception, KeyboardInterrupt) as exc:
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+        sys.exit(0)
+    except Exception as exc:
         print(f"Error: {exc}")
         sys.exit(1)
